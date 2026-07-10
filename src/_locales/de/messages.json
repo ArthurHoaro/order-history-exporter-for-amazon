@@ -47,6 +47,10 @@
     "message": "Exportieren",
     "description": "Export button text"
   },
+  "stopExport": {
+    "message": "Export abbrechen",
+    "description": "Stop button text"
+  },
   "exporting": {
     "message": "Exportiere...",
     "description": "Text shown while exporting"
@@ -141,6 +145,10 @@
     "message": "Datei wird erstellt...",
     "description": "Progress message while generating file"
   },
+  "exportStopped": {
+    "message": "Export vom Benutzer abgebrochen.",
+    "description": "Status message when export is stopped"
+  },
   "exportComplete": {
     "message": "Fertig! $COUNT$ Bestellungen exportiert.",
     "description": "Completion message with order count",
@@ -218,5 +226,21 @@
   "csvHeaderDetailsUrl": {
     "message": "Details-Link",
     "description": "CSV header for details URL"
+  },
+  "csvHeaderRecipientName": {
+    "message": "Empfängername",
+    "description": "CSV header for the shipping recipient's name"
+  },
+  "csvHeaderRecipientStreet": {
+    "message": "Empfängeradresse",
+    "description": "CSV header for the shipping recipient's street address (may include multiple lines joined by commas)"
+  },
+  "csvHeaderRecipientCityPostal": {
+    "message": "Stadt / PLZ des Empfängers",
+    "description": "CSV header for the shipping recipient's city and postal code line"
+  },
+  "csvHeaderRecipientCountry": {
+    "message": "Empfängerland",
+    "description": "CSV header for the shipping recipient's country"
   }
 }

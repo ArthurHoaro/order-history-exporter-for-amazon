@@ -20,11 +20,22 @@ import {
   parsePrice,
   parseOrderStatus,
 } from '../utils';
+import { STORAGE_KEY, STOP_FLAG_KEY } from '../constants';
 
 (function (): void {
   'use strict';
 
-  const STORAGE_KEY = 'amazonExporter';
+  /**
+   * In-memory stop flag for the current page load.
+   *
+   * Because the content script is reloaded on every page navigation, this flag
+   * only survives within a single page.  For cross-navigation stop requests
+   * (i.e. the user clicks "Stop" while the content script is between pages) we
+   * also persist the flag to `browser.storage.session` under STOP_FLAG_KEY.
+   * `checkExportState` reads that persisted flag on the next page load, so the
+   * stop takes effect even when the direct message is lost.
+   */
+  let stopRequested = false;
 
   /**
    * Get localized message from browser i18n API
@@ -48,6 +59,16 @@ import {
     if (msg.action === 'getExportStatus') {
       const state = getExportState();
       return Promise.resolve(state ? { success: true, ...state } : { success: false });
+    }
+    if (msg.action === 'stopExport') {
+      stopRequested = true;
+      clearExportState();
+      // Notify popup via dedicated action so it doesn't rely on string comparison
+      browser.runtime.sendMessage({ action: 'exportStopped' }).catch(() => {
+        // Popup may not be open — not an error condition
+        console.debug('[Amazon Exporter] Popup not reachable for exportStopped notification');
+      });
+      return Promise.resolve({ success: true });
     }
 
     return undefined;
@@ -83,28 +104,46 @@ import {
    * Check if we should continue an export after page navigation
    */
   function checkExportState(): void {
-    // Wait for page to be fully loaded
-    if (document.readyState !== 'complete') {
-      window.addEventListener('load', () => {
-        setTimeout(checkExportState, 500);
-      });
-      return;
-    }
+    const run = (): void => {
+      setTimeout(async () => {
+        // Check if stop was requested while the content script was unloaded.
+        // Wrap in try-catch: if storage.session is unavailable (missing
+        // permission / unsupported browser), we still want the resume logic
+        // below to execute.
+        try {
+          const stopFlag = await browser.storage.session.get(STOP_FLAG_KEY);
+          if (stopFlag[STOP_FLAG_KEY]) {
+            await browser.storage.session.remove(STOP_FLAG_KEY);
+            clearExportState();
+            return;
+          }
+        } catch {
+          console.debug('[Amazon Exporter] Could not read stop flag from storage.session');
+        }
 
-    // Additional delay to let Amazon's JS render
-    setTimeout(() => {
-      const state = getExportState();
-      if (state && state.inProgress) {
-        console.log('[Amazon Exporter]', getMessage('resumingExport'), state);
-        continueExport(state);
-      }
-    }, 1500);
+        const state = getExportState();
+        if (state && state.inProgress) {
+          console.log('[Amazon Exporter]', getMessage('resumingExport'), state);
+          continueExport(state);
+        }
+      }, 1500);
+    };
+
+    // Wait for page to be fully loaded, then add delay for Amazon's JS to render
+    if (document.readyState === 'complete') {
+      run();
+    } else {
+      window.addEventListener('load', run, { once: true });
+    }
   }
 
   /**
    * Start a new export
    */
   function startExport(options: ExportOptions): void {
+    // Reset stop flag for fresh export
+    stopRequested = false;
+
     const { format, startDate, endDate, exportAll } = options;
 
     // Get available years
@@ -162,6 +201,11 @@ import {
    * Continue an export after page navigation
    */
   function continueExport(state: ExportState): void {
+    // Check if stop was requested while away (e.g. between page navigations)
+    if (stopRequested || !getExportState()) {
+      return;
+    }
+
     const currentYear = state.yearsToProcess[state.currentYearIndex];
     const pageNum = String(Math.floor(state.currentStartIndex / 10) + 1);
     updateProgress(
@@ -176,6 +220,11 @@ import {
    * Scrape the current page and decide what to do next
    */
   function scrapeCurrentPageAndContinue(state: ExportState): void {
+    // Check if stop was requested mid-export
+    if (stopRequested || !getExportState()) {
+      return;
+    }
+
     const startDateObj = state.startDate ? new Date(state.startDate) : null;
     const endDateObj = state.endDate ? new Date(state.endDate) : null;
 
@@ -245,6 +294,11 @@ import {
 
     // Fetch item prices for multi-item orders
     await fetchOrderDetailsForPrices(state.collectedOrders);
+
+    // Check if stop was requested during price fetching (state already cleared by handler)
+    if (stopRequested || !getExportState()) {
+      return;
+    }
 
     updateProgress(95, getMessage('generatingFile'));
 
@@ -500,6 +554,10 @@ import {
       detailsUrl: '',
       promotions: [],
       totalSavings: 0,
+      recipientName: '',
+      recipientStreet: '',
+      recipientCityPostal: '',
+      recipientCountry: '',
     };
 
     const orderText = getOrderCardText(orderEl);
@@ -547,6 +605,13 @@ import {
     // Extract Items
     order.items = parseOrderItems(orderEl);
 
+    // Extract Recipient (name + address)
+    const recipient = parseRecipient(orderEl);
+    order.recipientName = recipient.name;
+    order.recipientStreet = recipient.street;
+    order.recipientCityPostal = recipient.cityPostal;
+    order.recipientCountry = recipient.country;
+
     // Filter out advertisement/fake orders
     // These typically have no date, no status, no details URL, and contain ads like "Amazon Visa"
     if (isAdvertisementOrder(order)) {
@@ -555,6 +620,108 @@ import {
     }
 
     return order;
+  }
+
+  /**
+   * Parse the recipient (name + shipping address) from an order element.
+   *
+   * Amazon embeds the shipping address inside `.yohtmlc-recipient`:
+   *  - The recipient name is inside `<a class="...insert-encrypted-trigger-text">`
+   *  - The full address is preloaded inside `.a-popover-preload`, as three `.a-row`s:
+   *      1. <h5>Name</h5>
+   *      2. Street lines + city/postal, separated by <br>
+   *      3. Country
+   *
+   * Returns empty strings for any field that cannot be located.
+   */
+  function parseRecipient(orderEl: Element): {
+    name: string;
+    street: string;
+    cityPostal: string;
+    country: string;
+  } {
+    const result = { name: '', street: '', cityPostal: '', country: '' };
+
+    const recipientEl = orderEl.querySelector('.yohtmlc-recipient');
+    if (!recipientEl) return result;
+
+    // Name: the trigger text inside the popover anchor
+    const triggerEl = recipientEl.querySelector(
+      'a.a-popover-trigger, .insert-encrypted-trigger-text'
+    );
+    if (triggerEl) {
+      // textContent includes the trailing icon span; .trim() handles whitespace,
+      // and the icon has no text so it doesn't pollute the result.
+      result.name = (triggerEl.textContent || '').trim();
+    }
+
+    // Full address: from the preloaded popover content
+    const preloadEl = recipientEl.querySelector('.a-popover-preload');
+    if (!preloadEl) return result;
+
+    const rows = preloadEl.querySelectorAll('.a-row');
+    if (rows.length === 0) return result;
+
+    // Fallback for name from the h5 inside the popover
+    if (!result.name) {
+      const h5 = preloadEl.querySelector('h5');
+      if (h5) result.name = (h5.textContent || '').trim();
+    }
+
+    // Walk through rows; skip the name row (the one containing an h5).
+    const addressRows: Element[] = [];
+    rows.forEach((row) => {
+      if (!row.querySelector('h5')) addressRows.push(row);
+    });
+
+    if (addressRows.length === 0) return result;
+
+    // Last address row = country. Everything before = street lines + city/postal.
+    const countryEl = addressRows[addressRows.length - 1];
+    if (countryEl) {
+      result.country = (countryEl.textContent || '').trim();
+    }
+
+    const streetRows = addressRows.slice(0, -1);
+
+    // Each row may contain multiple lines separated by <br>. Replace <br> with \n,
+    // strip remaining HTML, split into lines.
+    const allLines: string[] = [];
+    streetRows.forEach((row) => {
+      const html = row.innerHTML.replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '');
+      const decoded = decodeHtmlEntities(html);
+      decoded
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .forEach((line) => allLines.push(line));
+    });
+
+    if (allLines.length === 0) return result;
+
+    // Heuristic: the last line of the address block is the city + postal code
+    // (e.g. "Châteaumeillant 18370" or "Paris 75009"). Everything above is the
+    // street (possibly multi-line: "27, Rue X" + "Apt B" + ...).
+    result.cityPostal = allLines[allLines.length - 1] ?? '';
+    result.street = allLines.slice(0, -1).join(', ');
+
+    return result;
+  }
+
+  // Reused across decodeHtmlEntities calls to avoid allocating a fresh <textarea>
+  // per address row when parsing many orders.
+  let entityDecoderTextarea: HTMLTextAreaElement | null = null;
+
+  /**
+   * Lightweight HTML entity decoder for the small subset Amazon uses in addresses
+   * (we run inside a content script, so we can leverage the textarea trick).
+   */
+  function decodeHtmlEntities(text: string): string {
+    if (!entityDecoderTextarea) {
+      entityDecoderTextarea = document.createElement('textarea');
+    }
+    entityDecoderTextarea.innerHTML = text;
+    return entityDecoderTextarea.value;
   }
 
   /**
@@ -648,7 +815,6 @@ import {
           );
           if (qtyMatch?.[1]) {
             item.quantity = parseInt(qtyMatch[1], 10);
-            foundQuantity = true;
             break;
           }
           parentEl = parentEl.parentElement;
@@ -674,6 +840,11 @@ import {
     console.log('[Amazon Exporter] Fetching details for', ordersNeedingDetails.length, 'orders');
 
     for (let i = 0; i < ordersNeedingDetails.length; i++) {
+      // Check if stop was requested during price fetching
+      if (stopRequested || !getExportState()) {
+        break;
+      }
+
       const order = ordersNeedingDetails[i];
       if (!order) continue;
 
